@@ -485,6 +485,221 @@ if __name__ == "__main__":
 
 ---
 
-> **最后一步预告**：
-> 哇！你已经掌握了整个 Transformer 的身体（Encoder 层）！
-> Transformer 最初是为了机器翻译设计的，所以还有一个会“边看原文边逐字吐词”的 **Decoder (解码器)** 以及连接两者的 **Cross-Attention (交叉注意力)**。这就是咱们最后的拼图！
+## 六、 终极拼图：Decoder (解码器) 与交叉注意力
+
+我们已经掌握了能看懂全文的 Encoder。现在，我们要让模型学会**“边看原文，边逐字吐词”**。这就是 Decoder（解码器）的工作！
+
+Decoder 的结构和 Encoder 很像，但它多了两个极其关键的“新魔法”：**Masked Attention（掩码注意力）** 和 **Cross-Attention（交叉注意力）**。
+
+### 1. Masked Self-Attention (掩码自注意力)：禁止“偷看”未来
+
+**场景设定：** 机器翻译。原文（Encoder 输入）是 "I love you"，目标翻译（Decoder 输出）是 "我 爱 你"。
+
+在训练时，为了高效，我们会把 "我 爱 你" 一次性全部喂给 Decoder。
+但问题来了：当模型在翻译“爱”这个词时，它**绝对不能**提前看到后面的“你”字！因为在真正推断（测试）时，模型是一个字一个字往外蹦的，它不可能知道未来还没生成的字。
+
+**解决方案：Mask（掩盖面具）**
+我们在计算 Attention 相似度得分矩阵后，强行加一个“下三角面具”。
+* 把“我”和未来词（“爱”、“你”）的打分强制变成 `-无穷大`。
+* 经过 Softmax 后，这些 `-无穷大` 的位置权重就会变成 `0`。
+
+**直观比喻：蒙眼派对**
+这就像在派对上，“我”只能回头看自己，不能看别人；“爱”只能回头看“我”和它自己，不能看“你”。这样就完美模拟了人类“从左到右，逐字生成”的真实过程。
+
+### 2. Cross-Attention (交叉注意力)：寻找外援
+
+这是连接 Encoder（原文）和 Decoder（译文）的**唯一桥梁**！
+
+在 Decoder 层里，做完 Masked Self-Attention 后，词向量会进入 Cross-Attention 层。
+这个时候，Q、K、V 不再是同源的了！
+*   **Q (Query / 寻偶标准)**：来自 **Decoder**。比如当前生成的词是“爱”，它的 Q 就是：“我现在需要翻译原句里的哪个词？”
+*   **K (Key / 自我展示标签)**：来自 **Encoder 的最终输出**。原句词向量的自我介绍：“我是 I”，“我是 love”。
+*   **V (Value / 内在真实价值)**：同样来自 **Encoder 的最终输出**。
+
+**直观比喻：**
+Decoder 里的“爱”拿着自己的需求（Q），跑去 Encoder 的“外援团”里，挨个问原句的词（K）：“你们谁跟我的需求最匹配？”
+发现 "love" 的得分最高！于是，“爱”就大量吸收了 "love" 的信息（V）。
+这就是模型实现“翻译”或“对齐”的底层逻辑。
+
+### 3. 代码实战：组装完整的 Decoder Block
+
+```python
+import torch
+import torch.nn as nn
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff):
+        super().__init__()
+        # 1. 掩码多头自注意力 (禁止看未来)
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        # 2. 交叉注意力 (看 Encoder)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        # 3. 前馈神经网络
+        self.ffn = FeedForward(d_model, d_ff)
+
+        # 独立的 LayerNorm 层
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(self, x, memory, tgt_mask=None):
+        """
+        x: Decoder 的输入 (比如 "我 爱")
+        memory: Encoder 的最终输出向量 (比如 "I love you" 的特征)
+        tgt_mask: 遮挡未来词的面具 (下三角矩阵)
+        """
+        # ------------------------------------------
+        # 子层 1：Masked Self-Attention
+        # ------------------------------------------
+        residual = x
+        # 注意这里传入了 tgt_mask，防止偷看未来
+        attn1_output, _ = self.self_attn(x, x, x, attn_mask=tgt_mask)
+        x = self.norm1(residual + attn1_output)
+
+        # ------------------------------------------
+        # 子层 2：Cross-Attention (核心：Q来自Decoder, K和V来自Encoder)
+        # ------------------------------------------
+        residual = x
+        # query = x (Decoder的当前状态)
+        # key = value = memory (Encoder的输出)
+        attn2_output, _ = self.cross_attn(query=x, key=memory, value=memory)
+        x = self.norm2(residual + attn2_output)
+
+        # ------------------------------------------
+        # 子层 3：Feed Forward
+        # ------------------------------------------
+        residual = x
+        ffn_output = self.ffn(x)
+        x = self.norm3(residual + ffn_output)
+
+        return x
+
+# ==========================================
+# 动手观察验证
+# ==========================================
+if __name__ == "__main__":
+    d_model = 16
+    num_heads = 4
+    d_ff = 64
+    batch_size = 2
+
+    # 假设 Encoder 原文有 10 个词
+    src_len = 10
+    encoder_memory = torch.randn(batch_size, src_len, d_model)
+
+    # 假设 Decoder 目前正在生成第 5 个词
+    tgt_len = 5
+    decoder_input = torch.randn(batch_size, tgt_len, d_model)
+
+    # 生成下三角 Mask 矩阵 (掩盖未来信息)
+    # 对于长度 5，生成一个 5x5 的矩阵，右上角全为 -inf，左下角全为 0
+    tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len)
+
+    print("目标词 Mask 矩阵 (只允许看过去和自己):")
+    print(tgt_mask)
+
+    # 实例化 Decoder Block
+    decoder_block = TransformerDecoderLayer(d_model, num_heads, d_ff)
+
+    # 前向传播
+    output = decoder_block(decoder_input, encoder_memory, tgt_mask)
+
+    print(f"\nEncoder Memory 形状: {encoder_memory.shape}")
+    print(f"Decoder Input 形状: {decoder_input.shape}")
+    print(f"Decoder Output 形状: {output.shape}")
+    print("🎉 恭喜！你已彻底打通 Transformer 的任督二脉！")
+```
+
+---
+
+> **结语**：
+> 从基础的 QKV 算缘分，到多头的影分身；从给词发号码牌的 Positional Encoding，到不忘初心的 Add&Norm；最后到禁止偷看的 Mask 和寻求外援的 Cross-Attention。
+> Transformer 的所有核心拼图你都已经掌握了！这也是当今大语言模型（如 GPT、Claude、LLaMA）最底层的运作逻辑。
+
+---
+
+## 七、 上帝视角：把 "I love you" 翻译成 "我 爱 你" 的全流程串联
+
+我们现在就以上帝视角，把所有的“积木”串联起来，看看 Transformer 究竟是如何一步步把 **"I love you"** 翻译成 **"我 爱 你"** 的。
+
+整个过程分为三大阶段：**Encoder 读懂原文**、**Decoder 准备发力**、**Cross-Attention 跨界翻译**。
+
+### 第一阶段：Encoder 读懂原文
+
+**目标：把 "I love you" 嚼碎，揉成一个包含全局语境的“高维记忆体（Memory）”。**
+
+**1. 查字典与发号码牌**
+* 最开始，模型看到的是 `["I", "love", "you"]`。
+* 它去英语字典（Embedding矩阵）里查到三个原始词向量。
+* 接着，**Positional Encoding（位置编码）** 启动！它给 "I" 贴上代表位置1的滤镜，给 "love" 贴上位置2的滤镜，给 "you" 贴上位置3的滤镜（对应维度的数值直接相加）。
+* *现状：此时的 "love" 不仅是个动词，还深刻地知道自己在这个句子中间。*
+
+**2. 群聊融合（Multi-Head Self-Attention）**
+* 三个带有位置信息的词向量进入了 Encoder 的“微信群”。
+* 它们各自变出自己的身份：Q（需求）、K（标签）、V（内涵）。
+* "I" 发现自己是主语，它去看了看全群，发现 "love" 是动作，于是它吸取了 "love" 的信息。
+* "love" 也去看了全群，发现动作的发出者是 "I"，承受者是 "you"。于是 "love" 的向量疯狂吸收前后的信息。
+* *现状：现在的 "love" 已经不是死板的字典词汇了，它变成了一个动态向量，意思是“被 I 发出、作用于 you 的爱意动作”。*
+
+**3. 各自闭关修炼（Feed Forward）与基础设施（Add & Norm）**
+* 群聊结束后，为了防止忘了自己原本是谁，加上原来的自己（**Add 残差连接**），并深呼吸平复一下数值（**Layer Norm**）。
+* 然后这三个词分别进入独立的小黑屋（**Feed Forward 前馈网络**），通过 ReLU 激活函数进行高级逻辑推理，把刚才群聊获取的线索提炼成更高阶的语义结论。
+* 这个过程（群聊+闭关）会重复好几次（比如叠 6 层 Encoder Block）。
+
+**✅ Encoder 任务完成！**
+最终，Encoder 输出了一组全新的向量集合。我们管这个东西叫 **Memory（高维记忆体）**。它把 "I love you" 的结构、主谓宾关系、单词内涵全部打包好了。
+
+---
+
+### 第二阶段：Decoder 开始逐字憋词
+
+**目标：看着刚刚做好的 Memory，结合自己已经吐出来的中文字，预测下一个中文字。**
+
+假设我们现在正处于翻译的中期：Decoder 已经成功吐出了 `<Start> 我 爱`，正准备去预测下一个字（即“你”）。
+
+**1. 准备当前已有的译文**
+* 现在的输入是：`[<Start>, "我", "爱"]`。
+* 同样，查中文词典得到向量，并加上中文的**位置编码（Positional Encoding）**。
+
+**2. 戴上面具的群聊（Masked Self-Attention）**
+* 这三个中文字也建了个“微信群”，开始互相看，为了理顺中文自己的语法。
+* **关键点来了！Mask（面具）起作用了：**
+  * `<Start>` 只能看自己。
+  * "我" 只能看 `<Start>` 和自己。
+  * "爱" 只能看 `<Start>`、"我" 和自己。
+* 为什么？因为如果我们在训练时把后面的字漏给它，它就会作弊！Mask 保证了无论在训练还是推理时，当前字永远只能向左看历史，无法向右看未来。
+* *现状：通过这一层，中文内部的语境理顺了，“爱”这个字深刻理解了前面的主语是“我”。*
+
+---
+
+### 第三阶段：Cross-Attention 跨界翻译与最终预测
+
+**目标：拿着中文的需求，去英文的 Memory 里进货。**
+
+**3. 寻求外援（Cross-Attention）**
+* Decoder 这边刚刚处理完的词向量（特别是队伍最后面的那个词，代表当前最前沿的预测进度）想要获取翻译信息。
+* **大揭秘：** Decoder 里当前队伍最末尾的向量（包含了 "我 爱" 的全部信息），化身为 **Query (Q)**。它的需求潜台词是：*“我是中文‘爱’，我的主语是‘我’，我现在急需知道原文里我接下来该翻译谁？”*
+* 它拿着这个 Q，冲进了第一阶段做好的 **Encoder Memory** 库里。
+* 原文 Memory 里的每个词 ("I", "love", "you") 都举着自己的 **Key (K)** 来匹配。
+* Decoder 的 Q 发现，自己和 "you" 的 K 匹配得分奇高无比（因为主语和谓语都已经翻译过了，就差宾语了）。
+* 于是，它疯狂吸收 "you" 这个词的 **Value (V)**。
+
+**4. 最后的提炼与输出（FFN + Linear + Softmax）**
+* 吸收完 "you" 的英文精髓后，同样经过 **Add & Norm** 平复情绪，然后进入 **Feed Forward** 闭关提炼。
+* 最后，这个吸收了全部精华的向量，走进一个超级大的**全连接层（Linear）**。这个全连接层的大小等于中文词典的大小（比如包含 5 万个汉字）。
+* 它给字典里的每一个汉字打了一个分数。
+* 经过 **Softmax** 把分数变成概率。排在第一名、概率最大的那个字，正是：**“你”**！
+
+**循环继续：**
+现在我们有了 `<Start> 我 爱 你`。下一轮，把这四个词送进去重复整个过程，最后预测出 `<End>`（句号/结束符）。
+翻译彻底完成！
+
+---
+
+**总结全图：**
+1. **Encoder** 查字典加位置，通过无障碍群聊（Self-Attention）把英文句子的骨架和血肉揉成高维记忆体。
+2. **Decoder** 查字典加位置，戴着面具群聊（Masked Attention）理顺已生成的中文半成品的逻辑。
+3. **桥梁**：Decoder 拿着半成品的 Q，去 Encoder 那里匹配 K 并提取 V（Cross-Attention）。
+4. 最终在字典表里选出概率最大的下一个字！
+
+这就是 Transformer 震惊世界的魔法全过程。是不是有一种拨开云雾见青天的感觉？
