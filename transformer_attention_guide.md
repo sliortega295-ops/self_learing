@@ -31,22 +31,26 @@
 import torch
 import torch.nn as nn
 
-# d_model 是词向量的维度
-self.W_q = nn.Linear(d_model, d_model, bias=False)
-self.W_k = nn.Linear(d_model, d_model, bias=False)
-self.W_v = nn.Linear(d_model, d_model, bias=False)
+# d_model 是词向量的维度 (假设是 4)
+d_model = 4
+x = torch.rand(1, 3, d_model)  # (1句话, 3个词, 每个词4维)
+
+W_q = nn.Linear(d_model, d_model, bias=False)
+W_k = nn.Linear(d_model, d_model, bias=False)
+W_v = nn.Linear(d_model, d_model, bias=False)
 
 # 输入同一个 x，变出 Q, K, V
-Q = self.W_q(x)  
-K = self.W_k(x)  
-V = self.W_v(x)  
+Q = W_q(x)  
+K = W_k(x)  
+V = W_v(x)  
 ```
 
 ---
 
 ## 二、 矩阵乘法：高效的批量打分与融合
 
-论文中的公式：$Attention(Q, K, V) = softmax(\frac{QK^T}{\sqrt{d_k}})V$
+论文中的核心公式：
+$$Attention(Q, K, V) = softmax(\frac{QK^T}{\sqrt{d_k}})V$$
 
 ### 1. 第一步乘法：$Q \times K^T$ (计算相似度得分)
 **点积**衡量两个向量的相似度。**矩阵乘法**则是批量算点积。
@@ -56,8 +60,40 @@ $Q \times K^T$ 得到一个 $3 \times 3$ 的**注意力得分矩阵（Scores）*
 
 ### 2. 第二步乘法：$Weights \times V$ (加权混合信息)
 将 Scores 通过 Softmax 变成百分比（Weights），然后乘以 V 矩阵。
-*   Weights ($3 \times 3$) $\times$ V ($3 \times 2$特征) = Output ($3 \times 2$)。
-*   这一步没有任何 `for` 循环，矩阵乘法自动完成了**所有词对自己关注对象的加权求和**，生成了融合上下文的新词向量！
+
+**极简代码演示：**
+```python
+import torch
+import torch.nn.functional as F
+
+# 假设算出了 3个词互相的打分表 (3x3 矩阵)
+Scores = torch.tensor([
+    [1.00,  0.00,  0.50],  # 词1 给全场的打分
+    [0.00,  1.00,  0.50],  # 词2 给全场的打分
+    [0.00,  0.00,  0.00]   # 词3 给全场的打分
+])
+
+# Softmax 归一化 (每一行变成百分比)
+Weights = F.softmax(Scores, dim=-1)
+
+# 真实的 V 矩阵 (3个词，每个词 2维特征)
+V = torch.tensor([
+    [10.0,  0.0],  # 词1 V
+    [0.0,  10.0],  # 词2 V
+    [5.0,   5.0]   # 词3 V
+])
+
+# 矩阵相乘：权重 x 信息库
+Output = Weights @ V
+
+"""
+最终输出 Output:
+tensor([[6.60, 3.40],
+        [3.40, 6.60],
+        [5.00, 5.00]])
+矩阵乘法自动完成了**所有词对自己关注对象的加权求和**，生成了融合上下文的新词向量！
+"""
+```
 
 ---
 
@@ -83,23 +119,37 @@ $Q \times K^T$ 得到一个 $3 \times 3$ 的**注意力得分矩阵（Scores）*
 假设 2个词，4维特征，分 2个头（每个头2维）。
 切分并转置后，数据变成了以“头”为中心的两个独立小宇宙：
 
-**【头 1 (Head 1) 的专属 Q 矩阵】（拿到前2维）：**
-```text
-[1.0, 1.0]  <-- 词 A 的前2维
-[2.0, 2.0]  <-- 词 B 的前2维
-```
+**极简代码演示：**
+```python
+import torch
 
-**【头 2 (Head 2) 的专属 Q 矩阵】（拿到后2维）：**
-```text
-[9.0, 9.0]  <-- 词 A 的后2维
-[8.0, 8.0]  <-- 词 B 的后2维
+# 原始大 Q 矩阵 (1句话, 2个词, 4维特征)
+Q = torch.tensor([
+  [ [1.0, 1.0, 9.0, 9.0],  # 词 A
+    [2.0, 2.0, 8.0, 8.0] ] # 词 B
+])
+
+# 1. 切分 (view)
+Q_viewed = Q.view(1, 2, 2, 2)
+
+# 2. 换位 (transpose)
+Q_transposed = Q_viewed.transpose(1, 2)
+# 现在形状变成了 (1句话, 2个头, 2个词, 2维特征)
+
+# 查看分给 Head 1 的专属 Q 矩阵 (拿到了前 2 维)：
+# tensor([[1., 1.],
+#         [2., 2.]])
+
+# 查看分给 Head 2 的专属 Q 矩阵 (拿到了后 2 维)：
+# tensor([[9., 9.],
+#         [8., 8.]])
 ```
 
 **GPU 并行计算**：
-当执行 `Q @ K.transpose(-1, -2)` 时，Q 的形状是 `[1, 2, 2, 2]`。
+当执行 `Q_transposed @ K_transposed.transpose(-1, -2)` 时。
 GPU 看到前面的 `[1, 2]`（1个批次，2个头），它会自动启动 2 个并行线程：
-*   线程 1：拿头 1 的 $2 \times 2$ 小矩阵去乘头 1 的 $K$。
-*   线程 2：拿头 2 的 $2 \times 2$ 小矩阵去乘头 2 的 $K$。
+*   **线程 1**：拿头 1 的 $2 \times 2$ 小矩阵去乘头 1 的 $K$。
+*   **线程 2**：拿头 2 的 $2 \times 2$ 小矩阵去乘头 2 的 $K$。
 **互不干扰，瞬间算完两份独立的 Attention！**
 
-最后，将结果再次转置、view 拍扁并拼接回原来的维度，过一个最终的线性层 $W_O$，就得到了多维度融合的终极向量。
+最后，将结果再次转置、`view` 拍扁并拼接回原来的维度，过一个最终的线性层 $W_O$，就得到了多维度融合的终极向量。
