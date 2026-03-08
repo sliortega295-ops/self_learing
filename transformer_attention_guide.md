@@ -703,3 +703,194 @@ if __name__ == "__main__":
 4. 最终在字典表里选出概率最大的下一个字！
 
 这就是 Transformer 震惊世界的魔法全过程。是不是有一种拨开云雾见青天的感觉？
+
+---
+
+## 八、 终极大考：手写完整 Transformer 极简架构
+
+经过前面的拆解，我们已经把所有零件都打磨好了。现在，让我们把 **Encoder**、**Decoder** 加上 **Embedding（词嵌入）** 和 **Positional Encoding（位置编码）**，组装成一个完整的、可运行的 Transformer 极简网络架构代码！
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+# ----------------------------------
+# 1. 基础组件准备 (复用我们前面讲过的)
+# ----------------------------------
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :]
+        return x
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        return self.linear2(self.relu(self.linear1(x)))
+
+# ----------------------------------
+# 2. 核心大积木：Encoder 和 Decoder 层
+# ----------------------------------
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.ffn = FeedForward(d_model, d_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x, src_mask=None):
+        # 1. Self-Attention (群聊融合)
+        attn_output, _ = self.self_attn(x, x, x, attn_mask=src_mask)
+        x = self.norm1(x + attn_output)
+        # 2. Feed Forward (闭关修炼)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)
+        return x
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.ffn = FeedForward(d_model, d_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(self, x, memory, tgt_mask=None):
+        # 1. Masked Self-Attention (防作弊群聊)
+        attn1_output, _ = self.self_attn(x, x, x, attn_mask=tgt_mask)
+        x = self.norm1(x + attn1_output)
+        # 2. Cross-Attention (寻找外援)
+        attn2_output, _ = self.cross_attn(query=x, key=memory, value=memory)
+        x = self.norm2(x + attn2_output)
+        # 3. Feed Forward (闭关修炼)
+        ffn_output = self.ffn(x)
+        x = self.norm3(x + ffn_output)
+        return x
+
+# ----------------------------------
+# 3. 终极组装：完整的 Transformer 架构
+# ----------------------------------
+
+class SimpleTransformer(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model=512, num_heads=8, d_ff=2048, num_layers=6):
+        super().__init__()
+
+        # 1. 词典查表层 (查字典)
+        self.src_embedding = nn.Embedding(src_vocab_size, d_model)
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model)
+
+        # 2. 发号码牌 (位置编码)
+        self.pe = PositionalEncoding(d_model)
+
+        # 3. 堆叠多层 Encoder
+        self.encoder_layers = nn.ModuleList(
+            [TransformerEncoderLayer(d_model, num_heads, d_ff) for _ in range(num_layers)]
+        )
+
+        # 4. 堆叠多层 Decoder
+        self.decoder_layers = nn.ModuleList(
+            [TransformerDecoderLayer(d_model, num_heads, d_ff) for _ in range(num_layers)]
+        )
+
+        # 5. 最后的分类器 (变成字典里每个词的概率打分)
+        self.fc_out = nn.Linear(d_model, tgt_vocab_size)
+
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        """
+        src: 原文的整数索引序列 (batch_size, src_len)
+        tgt: 译文的整数索引序列 (batch_size, tgt_len)
+        """
+        # ==================================
+        # 阶段一：Encoder 读懂原文
+        # ==================================
+        # 查字典并加上位置编码
+        enc_input = self.pe(self.src_embedding(src))
+
+        # 穿过每一层 Encoder，生成最终的高维记忆体 Memory
+        memory = enc_input
+        for layer in self.encoder_layers:
+            memory = layer(memory, src_mask)
+
+        # ==================================
+        # 阶段二与三：Decoder 憋词与交叉翻译
+        # ==================================
+        # 查字典并加上位置编码
+        dec_input = self.pe(self.tgt_embedding(tgt))
+
+        # 穿过每一层 Decoder (带着面具，并看着 Memory)
+        x = dec_input
+        for layer in self.decoder_layers:
+            x = layer(x, memory, tgt_mask)
+
+        # ==================================
+        # 阶段四：预测下一个词
+        # ==================================
+        # 输出形状: (batch_size, tgt_len, tgt_vocab_size)
+        logits = self.fc_out(x)
+        return logits
+
+# ==========================================
+# 试运行一下我们的终极造物！
+# ==========================================
+if __name__ == "__main__":
+    # 假设我们有一个超小型的词典
+    src_vocab_size = 1000 # 英文词典有 1000 个词
+    tgt_vocab_size = 2000 # 中文词典有 2000 个字
+
+    # 实例化完整的 Transformer
+    # (为了演示跑得快，我们把特征维度 d_model 设小点，层数设为 2)
+    model = SimpleTransformer(
+        src_vocab_size=src_vocab_size,
+        tgt_vocab_size=tgt_vocab_size,
+        d_model=64,
+        num_heads=4,
+        num_layers=2
+    )
+
+    # 伪造一些输入数据
+    batch_size = 2
+    src_len = 10 # 原文 10 个词 ("I love you...")
+    tgt_len = 5  # 目前翻译了 5 个字 ("<Start> 我 爱...")
+
+    src_data = torch.randint(0, src_vocab_size, (batch_size, src_len))
+    tgt_data = torch.randint(0, tgt_vocab_size, (batch_size, tgt_len))
+
+    # 核心：必须给目标端生成下三角面具防作弊！
+    tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len)
+
+    # 万事俱备，前向传播！
+    predictions = model(src_data, tgt_data, tgt_mask=tgt_mask)
+
+    print("模型运行成功！🎉")
+    print(f"最终预测输出形状: {predictions.shape}")
+    print("解释：")
+    print(f"- Batch Size (批次大小): {predictions.size(0)}")
+    print(f"- Target Length (当前生成长度): {predictions.size(1)}")
+    print(f"- Vocab Probabilities (对字典里 {predictions.size(2)} 个词的概率打分)")
+```
+
+**代码架构说明：**
+* 我们使用了 `nn.ModuleList` 来**堆叠多层**网络。原论文中堆叠了 6 层 Encoder 和 6 层 Decoder。深度越深，模型能够理解的语义就越抽象、越复杂。
+* 整个网络的数据流非常清晰：**原文索引 -> Embedding -> 加位置编码 -> 进多层 Encoder 得出 Memory -> 译文索引 -> Embedding -> 加位置编码 -> 进多层 Decoder (结合 Mask 和 Memory) -> 线性层打分 -> 输出。**
+
+这就是支撑起整个现代 AI 黄金时代的终极代码骨架。建议你可以自己复制这段代码，随意修改 `d_model`、`num_layers` 等参数，跑一跑看看张量维度的变化，这会对你的理解有极大的帮助！
